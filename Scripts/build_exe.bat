@@ -1,42 +1,69 @@
 @echo off
-setlocal
-echo ==================================================
-echo    PDF Image Remover  -  Build Windows EXE
-echo ==================================================
-echo.
+REM ====================================================================
+REM  PDF Image Remover - build a standalone Windows EXE with PyInstaller
+REM  Author: Jerry James   License: GPL-3.0
+REM
+REM  Folder layout (this script lives in "Scripts"):
+REM     <project>\Scripts\          <- all source + this script
+REM     <project>\Published_Tool\   <- the finished EXE is placed here
+REM
+REM  The build's temporary folders (build\, *.spec, build_info.py) are
+REM  created inside Scripts and can be wiped with clean.bat before commit.
+REM ====================================================================
+setlocal enabledelayedexpansion
+cd /d "%~dp0"
 
-REM Prefer the Python launcher (py), fall back to python on PATH
-set "PYCMD=py -3"
-py -3 --version >nul 2>nul
-if errorlevel 1 set "PYCMD=python"
-
-%PYCMD% --version >nul 2>nul
-if errorlevel 1 (
-    echo [ERROR] Python not found. Install Python 3.8+ first.
-    echo.
-    pause
-    exit /b 1
+where py >nul 2>nul
+if %ERRORLEVEL%==0 (
+    set "PY=py -3"
+) else (
+    set "PY=python"
 )
 
-echo Installing build tools (PyMuPDF + PyInstaller)...
-%PYCMD% -m pip install --upgrade pip
-%PYCMD% -m pip install -r "%~dp0requirements.txt" pyinstaller
+echo Ensuring PyInstaller and dependencies are installed...
+%PY% -m pip install --upgrade pyinstaller >nul 2>nul
+%PY% -m pip install -r requirements.txt >nul 2>nul
+
+REM ---- Stamp the build date/time into build_info.py ----
+echo Stamping build date/time...
+%PY% -c "import datetime,io; open('build_info.py','w',encoding='utf-8').write('# Auto-generated at build time. Reset by clean.bat.\nBUILD_DATE = \"%date% %time%\"\n')"
+
+REM ---- Output EXE goes to ..\Published_Tool ; temp stays in Scripts ----
+if not exist "..\Published_Tool" mkdir "..\Published_Tool"
+
+echo.
+echo Building EXE (this can take a couple of minutes)...
 echo.
 
-echo Building single-file executable (this can take a minute)...
-%PYCMD% -m PyInstaller --noconfirm --clean --onefile --windowed ^
-    --name "PDFImageRemover" ^
-    --collect-all pymupdf ^
-    "%~dp0pdf_image_remover.py"
+%PY% -m PyInstaller ^
+  --noconfirm ^
+  --onefile ^
+  --windowed ^
+  --name "PDFImageRemover" ^
+  --icon "icon.ico" ^
+  --splash "splash.png" ^
+  --add-data "splash.png;." ^
+  --add-data "icon.ico;." ^
+  --add-data "icon_preview.png;." ^
+  --add-data "LICENSE;." ^
+  --collect-all customtkinter ^
+  --collect-all pymupdf ^
+  --collect-all fitz ^
+  --distpath "..\Published_Tool" ^
+  --workpath "build" ^
+  --specpath "." ^
+  pdf_image_remover.py
 
 echo.
-if exist "%~dp0dist\PDFImageRemover.exe" (
-    echo [OK] Build complete.
-    echo Your program is here:
-    echo     %~dp0dist\PDFImageRemover.exe
-    echo You can copy that .exe anywhere and run it without Python.
+if exist "..\Published_Tool\PDFImageRemover.exe" (
+    echo ============================================================
+    echo  SUCCESS. Your program is at:
+    echo     ..\Published_Tool\PDFImageRemover.exe
+    echo ============================================================
+    echo  Tip: run clean.bat to delete build temp files before commit.
 ) else (
-    echo [ERROR] Build did not produce an exe - see the messages above.
+    echo Build did not produce an EXE. Scroll up for the PyInstaller error.
 )
 echo.
 pause
+endlocal

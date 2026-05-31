@@ -1,0 +1,20 @@
+# Build / packaging artifacts
+build/
+dist/
+*.spec
+*.manifest
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# The finished EXE is large; keep it out of git by default.
+# (Remove the next line if you DO want to commit the built binary.)
+/Published_Tool/*.exe
+
+# OS noise
+.DS_Store
+Thumbs.db

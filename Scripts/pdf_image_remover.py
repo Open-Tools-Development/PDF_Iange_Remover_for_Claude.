@@ -1,131 +1,53 @@
 #!/usr/bin/env python3
 """
-PDF Image Remover
-=================
-A desktop tool that removes images from PDF files while preserving the text
-content and the original page layout.
+PDF Image Remover  -  main application (CustomTkinter GUI)
+==========================================================
+A desktop tool that can:
+  * remove images from PDFs (raster-only, or images + vector figures),
+  * convert a PDF to a compilable IEEE LaTeX project, or
+  * convert a PDF to a full-text Markdown file (no images).
 
-Two removal modes
-------------------
-1. Images only (default)
-   Removes embedded raster images (photographs, scanned figures, logos).
-   Keeps vector graphics (line charts/plots, diagrams), tables, equations and
-   the exact text layout. This is enough to avoid the per-upload image limit
-   when sending PDFs to Claude AI, because Claude does not count vector graphics
-   as images.
+Author: Jerry James.  License: GPL-3.0.
 
-2. Images + figures/charts (text-only)
-   Also removes vector graphics (plots, diagrams, and any vector-drawn tables),
-   leaving a clean text-only PDF. Use this when you want the figures physically
-   gone. Note: in many IEEE papers the plots AND the numeric table grids are
-   drawn as vector graphics, so this mode removes both - the figure/table
-   *captions* (which are real text) are kept.
-
-Both modes keep text byte-identical and in the same positions, and the result
-contains zero raster images. The whole-page redaction technique also removes
-images that are nested inside Form XObjects (a case a per-image search can miss).
-
-Requires: Python 3.8+  and  PyMuPDF>=1.24  (pip install PyMuPDF)
-Tkinter ships with the standard CPython installer on Windows/macOS.
+The heavy lifting lives in sibling modules (pdf_remove, pdf_to_latex,
+pdf_to_markdown, pdf_common); this file is the UI and the batch runner.
 """
 
 import os
 import sys
-import threading
 import queue
+import threading
 import traceback
 
-try:
-    import fitz  # PyMuPDF
-except Exception:  # noqa: BLE001
-    fitz = None
-
+import customtkinter as ctk
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import filedialog, messagebox
 
-
-APP_TITLE = "PDF Image Remover"
-APP_VERSION = "1.1"
-DEFAULT_SUFFIX = "_noimg"
+import about_info
+from pdf_remove import remove_images_from_pdf
+from pdf_to_latex import convert_pdf_to_latex
+from pdf_to_markdown import convert_pdf_to_markdown
 
 
 # --------------------------------------------------------------------------- #
-#  Core logic (no UI) - tested end to end on real IEEE PDFs                    #
+#  Helpers                                                                     #
 # --------------------------------------------------------------------------- #
-def _apply_redactions(page, remove_vector):
-    """Apply a redaction that removes raster images (always) and, when
-    ``remove_vector`` is set, vector line-art too. Text is never removed.
-    Falls back gracefully on older PyMuPDF builds."""
-    graphics = (
-        fitz.PDF_REDACT_LINE_ART_REMOVE_IF_TOUCHED
-        if remove_vector
-        else fitz.PDF_REDACT_LINE_ART_NONE
-    )
+def resource_path(rel):
+    """Resolve a bundled asset path (works in dev and in a PyInstaller exe)."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, rel)
+
+
+def close_pyi_splash():
+    """Close the PyInstaller native splash (if running as a frozen exe)."""
     try:
-        page.apply_redactions(
-            images=fitz.PDF_REDACT_IMAGE_REMOVE,
-            graphics=graphics,
-            text=fitz.PDF_REDACT_TEXT_NONE,
-        )
-        return
-    except (TypeError, AttributeError):
-        pass
-    try:
-        page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_REMOVE)
-    except (TypeError, AttributeError):
-        page.apply_redactions()
-
-
-def remove_images_from_pdf(input_path, output_path, remove_vector=False):
-    """Remove images from ``input_path`` and write ``output_path``.
-
-    If ``remove_vector`` is False (default): remove raster images only, keeping
-    vector graphics, tables, equations and the exact text layout.
-    If True: also remove vector graphics, producing a text-only PDF.
-
-    Returns ``(removed, remaining)``:
-        removed   - number of raster images removed
-        remaining - raster images still detected afterwards (expected 0)
-    """
-    doc = fitz.open(input_path)
-    removed = 0
-    try:
-        for page in doc:
-            n_imgs = len(page.get_images(full=True))
-            n_draws = len(page.get_drawings()) if remove_vector else 0
-            if n_imgs == 0 and n_draws == 0:
-                continue
-            # A single whole-page redaction box. With image removal this also
-            # clears images nested inside Form XObjects, which a per-image
-            # rectangle search can miss. fill=False paints nothing; text and
-            # (in images-only mode) vector graphics are preserved.
-            try:
-                page.add_redact_annot(page.rect, fill=False, cross_out=False)
-            except TypeError:
-                page.add_redact_annot(page.rect, fill=False)
-            _apply_redactions(page, remove_vector)
-            removed += n_imgs
-
-        # garbage=4 + clean=True physically drop orphaned objects so the saved
-        # file contains no image data at all.
-        doc.save(output_path, garbage=4, deflate=True, clean=True)
-    finally:
-        doc.close()
-
-    remaining = 0
-    try:
-        check = fitz.open(output_path)
-        for page in check:
-            remaining += len(page.get_images(full=True))
-        check.close()
+        import pyi_splash  # only exists in the frozen exe
+        pyi_splash.close()
     except Exception:
-        remaining = -1  # could not verify
-
-    return removed, remaining
+        pass
 
 
 def find_pdfs_in_folder(folder, recursive=False):
-    """Return a sorted list of .pdf file paths in ``folder``."""
     found = []
     if recursive:
         for root, _dirs, files in os.walk(folder):
@@ -141,142 +63,381 @@ def find_pdfs_in_folder(folder, recursive=False):
 
 
 # --------------------------------------------------------------------------- #
-#  GUI                                                                         #
+#  Splash (shown when running from source; the exe uses PyInstaller's splash)  #
 # --------------------------------------------------------------------------- #
-class PdfImageRemoverApp:
-    def __init__(self, root):
-        self.root = root
+def show_source_splash(duration_ms=1800):
+    if getattr(sys, "frozen", False):
+        return  # exe already shows the native splash
+    splash_img = resource_path("splash.png")
+    if not os.path.exists(splash_img):
+        return None
+    try:
+        top = ctk.CTkToplevel()
+        top.overrideredirect(True)
+        img = tk.PhotoImage(file=splash_img)
+        w, h = img.width(), img.height()
+        sw = top.winfo_screenwidth()
+        sh = top.winfo_screenheight()
+        top.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
+        lbl = tk.Label(top, image=img, borderwidth=0)
+        lbl.image = img
+        lbl.pack()
+        top.after(duration_ms, top.destroy)
+        top.update()
+        return top
+    except Exception:
+        return None
+
+
+# --------------------------------------------------------------------------- #
+#  About dialog                                                                #
+# --------------------------------------------------------------------------- #
+class AboutDialog(ctk.CTkToplevel):
+    def __init__(self, master):
+        super().__init__(master)
+        self.title(f"About {about_info.APP_NAME}")
+        self.geometry("640x640")
+        self.resizable(False, True)
+        self.after(50, self.grab_set)
+
+        header = ctk.CTkFrame(self, corner_radius=0)
+        header.pack(fill="x")
+        try:
+            from PIL import Image
+            ico = ctk.CTkImage(Image.open(resource_path("icon_preview.png")),
+                               size=(64, 64))
+            ctk.CTkLabel(header, image=ico, text="").pack(side="left",
+                                                          padx=14, pady=12)
+        except Exception:
+            pass
+        title_box = ctk.CTkFrame(header, fg_color="transparent")
+        title_box.pack(side="left", pady=12)
+        ctk.CTkLabel(title_box, text=about_info.APP_NAME,
+                     font=ctk.CTkFont(size=22, weight="bold")).pack(anchor="w")
+        ctk.CTkLabel(title_box, text=about_info.TAGLINE,
+                     text_color=("#0284c7", "#38bdf8")).pack(anchor="w")
+
+        body = ctk.CTkScrollableFrame(self)
+        body.pack(fill="both", expand=True, padx=14, pady=14)
+
+        def section(title):
+            ctk.CTkLabel(body, text=title,
+                         font=ctk.CTkFont(size=15, weight="bold"),
+                         anchor="w").pack(fill="x", pady=(12, 4))
+
+        def para(text):
+            ctk.CTkLabel(body, text=text, justify="left", anchor="w",
+                         wraplength=560).pack(fill="x", pady=2)
+
+        para(f"Version: {about_info.VERSION}")
+        para(f"Build: {about_info.build_date_string()}")
+        para(f"Author: {about_info.AUTHOR}")
+        para(f"License: {about_info.LICENSE}")
+        para(about_info.COPYRIGHT)
+
+        section("About")
+        para(about_info.DESCRIPTION)
+
+        section("Features")
+        for f in about_info.FEATURES:
+            para("\u2022  " + f)
+
+        section("How to use")
+        for h in about_info.HOW_TO:
+            para(h)
+
+        section("Notes")
+        for n in about_info.NOTES:
+            para("\u2022  " + n)
+
+        section("This program is free software")
+        para("It is distributed under the GNU General Public License v3.0, "
+             "in the hope that it will be useful, but WITHOUT ANY WARRANTY; "
+             "without even the implied warranty of MERCHANTABILITY or FITNESS "
+             "FOR A PARTICULAR PURPOSE. See the LICENSE file for details.")
+
+        ctk.CTkButton(self, text="Close", command=self.destroy).pack(pady=10)
+
+
+# --------------------------------------------------------------------------- #
+#  Main application                                                            #
+# --------------------------------------------------------------------------- #
+class App(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title(f"{about_info.APP_NAME}  v{about_info.VERSION}")
+        self.geometry("900x720")
+        self.minsize(820, 660)
+
         self.pdf_paths = []
-        self.output_dir = tk.StringVar(value="")
-        self.suffix_var = tk.BooleanVar(value=True)
-        self.recursive_var = tk.BooleanVar(value=False)
-        self.mode_var = tk.StringVar(value="images")  # "images" or "all"
         self.msg_queue = queue.Queue()
         self.worker = None
 
-        root.title(f"{APP_TITLE}  v{APP_VERSION}")
-        root.geometry("700x760")
-        root.minsize(640, 680)
+        # State variables
+        self.operation = tk.StringVar(value="")          # "" => nothing chosen
+        self.remove_mode = tk.StringVar(value="images")  # images | all
+        self.suffix_var = tk.BooleanVar(value=True)
+        self.recursive_var = tk.BooleanVar(value=False)
+        # Output location for each operation: "beside" | "folder"
+        self.remove_dest = tk.StringVar(value="folder")
+        self.latex_dest = tk.StringVar(value="beside")
+        self.md_dest = tk.StringVar(value="beside")
+        self.output_dir = tk.StringVar(value="")
 
         self._build_ui()
-        self.root.after(100, self._poll_queue)
+        self.after(120, self._poll_queue)
 
+    # ------------------------------- layout ------------------------------- #
     def _build_ui(self):
-        pad = {"padx": 10, "pady": 6}
+        self.grid_columnconfigure(0, weight=3)
+        self.grid_columnconfigure(1, weight=2)
+        self.grid_rowconfigure(1, weight=1)
 
-        header = ttk.Frame(self.root)
-        header.pack(fill="x", **pad)
-        ttk.Label(header, text=APP_TITLE,
-                  font=("Segoe UI", 16, "bold")).pack(anchor="w")
-        ttk.Label(
-            header,
-            text="Remove images from PDFs. Text and layout stay intact, "
-                 "and the result contains no raster images.",
-            foreground="#555",
-        ).pack(anchor="w")
+        # ---- Header ----
+        header = ctk.CTkFrame(self, corner_radius=0)
+        header.grid(row=0, column=0, columnspan=2, sticky="ew")
+        header.grid_columnconfigure(0, weight=1)
+        htext = ctk.CTkFrame(header, fg_color="transparent")
+        htext.grid(row=0, column=0, sticky="w", padx=16, pady=10)
+        ctk.CTkLabel(htext, text=about_info.APP_NAME,
+                     font=ctk.CTkFont(size=20, weight="bold")).pack(anchor="w")
+        ctk.CTkLabel(htext, text=about_info.TAGLINE,
+                     text_color=("#0284c7", "#38bdf8")).pack(anchor="w")
+        ctk.CTkButton(header, text="About / Help", width=120,
+                      command=self._open_about).grid(row=0, column=1,
+                                                     padx=16, pady=10)
 
-        # --- Step 1: input ---
-        in_frame = ttk.LabelFrame(self.root, text="1. Choose PDFs to process")
-        in_frame.pack(fill="both", expand=True, **pad)
+        # ---- Left column: file queue ----
+        left = ctk.CTkFrame(self)
+        left.grid(row=1, column=0, sticky="nsew", padx=(12, 6), pady=12)
+        left.grid_rowconfigure(2, weight=1)
+        left.grid_columnconfigure(0, weight=1)
 
-        btn_row = ttk.Frame(in_frame)
-        btn_row.pack(fill="x", padx=8, pady=8)
-        ttk.Button(btn_row, text="Add PDF File(s)…",
-                   command=self.add_files).pack(side="left")
-        ttk.Button(btn_row, text="Add Folder…",
-                   command=self.add_folder).pack(side="left", padx=6)
-        ttk.Checkbutton(btn_row, text="Include subfolders",
-                        variable=self.recursive_var).pack(side="left", padx=6)
-        ttk.Button(btn_row, text="Remove Selected",
-                   command=self.remove_selected).pack(side="right")
-        ttk.Button(btn_row, text="Clear List",
-                   command=self.clear_list).pack(side="right", padx=6)
+        ctk.CTkLabel(left, text="1.  PDFs to process",
+                     font=ctk.CTkFont(size=15, weight="bold")
+                     ).grid(row=0, column=0, sticky="w", padx=12, pady=(12, 4))
 
-        self.count_label = ttk.Label(in_frame, text="PDFs queued: 0")
-        self.count_label.pack(anchor="w", padx=8)
+        btnrow = ctk.CTkFrame(left, fg_color="transparent")
+        btnrow.grid(row=1, column=0, sticky="ew", padx=10)
+        ctk.CTkButton(btnrow, text="Add PDF File(s)\u2026", width=130,
+                      command=self.add_files).pack(side="left", padx=4, pady=4)
+        ctk.CTkButton(btnrow, text="Add Folder\u2026", width=110,
+                      command=self.add_folder).pack(side="left", padx=4)
+        ctk.CTkCheckBox(btnrow, text="Subfolders",
+                        variable=self.recursive_var).pack(side="left", padx=8)
 
-        list_wrap = ttk.Frame(in_frame)
-        list_wrap.pack(fill="both", expand=True, padx=8, pady=(2, 8))
-        self.listbox = tk.Listbox(list_wrap, selectmode=tk.EXTENDED,
-                                  activestyle="dotbox")
-        yscroll = ttk.Scrollbar(list_wrap, orient="vertical",
-                                command=self.listbox.yview)
-        xscroll = ttk.Scrollbar(list_wrap, orient="horizontal",
-                                command=self.listbox.xview)
-        self.listbox.configure(yscrollcommand=yscroll.set,
-                               xscrollcommand=xscroll.set)
+        # File list (themed tk.Listbox inside CTk for selection support).
+        list_wrap = ctk.CTkFrame(left)
+        list_wrap.grid(row=2, column=0, sticky="nsew", padx=10, pady=8)
+        list_wrap.grid_rowconfigure(0, weight=1)
+        list_wrap.grid_columnconfigure(0, weight=1)
+        self.listbox = tk.Listbox(
+            list_wrap, selectmode=tk.EXTENDED, activestyle="none",
+            background="#1d2433", foreground="#e2e8f0",
+            selectbackground="#38bdf8", selectforeground="#0f172a",
+            highlightthickness=0, borderwidth=0, font=("Segoe UI", 10),
+        )
+        ys = ctk.CTkScrollbar(list_wrap, command=self.listbox.yview)
+        self.listbox.configure(yscrollcommand=ys.set)
         self.listbox.grid(row=0, column=0, sticky="nsew")
-        yscroll.grid(row=0, column=1, sticky="ns")
-        xscroll.grid(row=1, column=0, sticky="ew")
-        list_wrap.rowconfigure(0, weight=1)
-        list_wrap.columnconfigure(0, weight=1)
+        ys.grid(row=0, column=1, sticky="ns")
 
-        # --- Step 2: removal mode ---
-        mode_frame = ttk.LabelFrame(self.root, text="2. What to remove")
-        mode_frame.pack(fill="x", **pad)
-        ttk.Radiobutton(
-            mode_frame,
-            text="Images only  —  raster photos/scanned figures. Keeps charts, "
-                 "tables, equations and layout. (Recommended; clears Claude's "
-                 "image limit.)",
-            variable=self.mode_var, value="images",
-        ).pack(anchor="w", padx=8, pady=(8, 2))
-        ttk.Radiobutton(
-            mode_frame,
-            text="Images + figures/charts  —  also removes vector plots, "
-                 "diagrams and vector-drawn tables (text-only result). "
-                 "Captions are kept.",
-            variable=self.mode_var, value="all",
-        ).pack(anchor="w", padx=8, pady=(0, 8))
+        delrow = ctk.CTkFrame(left, fg_color="transparent")
+        delrow.grid(row=3, column=0, sticky="ew", padx=10, pady=(0, 10))
+        self.count_label = ctk.CTkLabel(delrow, text="Queued: 0")
+        self.count_label.pack(side="left", padx=4)
+        ctk.CTkButton(delrow, text="Clear", width=70, fg_color="gray30",
+                      hover_color="gray25",
+                      command=self.clear_list).pack(side="right", padx=4)
+        ctk.CTkButton(delrow, text="Remove selected", width=130,
+                      fg_color="gray30", hover_color="gray25",
+                      command=self.remove_selected).pack(side="right", padx=4)
 
-        # --- Step 3: output ---
-        out_frame = ttk.LabelFrame(self.root, text="3. Choose output folder")
-        out_frame.pack(fill="x", **pad)
-        row = ttk.Frame(out_frame)
-        row.pack(fill="x", padx=8, pady=8)
-        self.out_entry = ttk.Entry(row, textvariable=self.output_dir)
-        self.out_entry.pack(side="left", fill="x", expand=True)
-        ttk.Button(row, text="Browse…",
-                   command=self.choose_output).pack(side="left", padx=6)
-        ttk.Checkbutton(
-            out_frame,
-            text='Append "_noimg" to output file names (recommended, '
-                 "prevents overwriting originals)",
-            variable=self.suffix_var,
-        ).pack(anchor="w", padx=8, pady=(0, 8))
+        # ---- Right column: operation + options ----
+        right = ctk.CTkScrollableFrame(self, label_text="")
+        right.grid(row=1, column=1, sticky="nsew", padx=(6, 12), pady=12)
+        right.grid_columnconfigure(0, weight=1)
 
-        # --- Step 4: run ---
-        run_frame = ttk.Frame(self.root)
-        run_frame.pack(fill="x", **pad)
-        self.run_btn = ttk.Button(run_frame, text="Remove Images",
-                                  command=self.start_processing)
-        self.run_btn.pack(side="left")
-        self.progress = ttk.Progressbar(run_frame, mode="determinate")
-        self.progress.pack(side="left", fill="x", expand=True, padx=10)
+        ctk.CTkLabel(right, text="2.  Operation  (choose one)",
+                     font=ctk.CTkFont(size=15, weight="bold")
+                     ).grid(row=0, column=0, sticky="w", pady=(4, 2))
+        ctk.CTkLabel(right, text="Nothing is selected by default.",
+                     text_color="gray", anchor="w"
+                     ).grid(row=1, column=0, sticky="w", pady=(0, 6))
 
-        # --- Log ---
-        log_frame = ttk.LabelFrame(self.root, text="Log")
-        log_frame.pack(fill="both", expand=True, **pad)
-        self.log = tk.Text(log_frame, height=8, wrap="word", state="disabled",
-                           background="#1e1e1e", foreground="#e0e0e0")
-        log_scroll = ttk.Scrollbar(log_frame, orient="vertical",
-                                   command=self.log.yview)
-        self.log.configure(yscrollcommand=log_scroll.set)
-        self.log.pack(side="left", fill="both", expand=True, padx=(8, 0),
-                      pady=8)
-        log_scroll.pack(side="right", fill="y", pady=8, padx=(0, 8))
+        ops = ctk.CTkFrame(right)
+        ops.grid(row=2, column=0, sticky="ew", pady=4)
+        ctk.CTkRadioButton(ops, text="Remove images from PDF",
+                           variable=self.operation, value="remove",
+                           command=self._refresh_panels
+                           ).pack(anchor="w", padx=10, pady=(10, 4))
+        ctk.CTkRadioButton(ops, text="Convert PDF \u2192 LaTeX",
+                           variable=self.operation, value="latex",
+                           command=self._refresh_panels
+                           ).pack(anchor="w", padx=10, pady=4)
+        ctk.CTkRadioButton(ops, text="Convert PDF \u2192 Markdown (full text)",
+                           variable=self.operation, value="markdown",
+                           command=self._refresh_panels
+                           ).pack(anchor="w", padx=10, pady=(4, 10))
 
-        if fitz is None:
-            self._log("PyMuPDF is not installed. Run install_dependencies.bat "
-                      "(or: pip install PyMuPDF) and restart this tool.")
-            self.run_btn.state(["disabled"])
+        # Options container (panels swapped depending on the operation).
+        ctk.CTkLabel(right, text="3.  Options",
+                     font=ctk.CTkFont(size=15, weight="bold")
+                     ).grid(row=3, column=0, sticky="w", pady=(12, 2))
+        self.options_holder = ctk.CTkFrame(right, fg_color="transparent")
+        self.options_holder.grid(row=4, column=0, sticky="ew")
+        self.options_holder.grid_columnconfigure(0, weight=1)
 
-    # --------------------------- list handling ---------------------------- #
+        self._build_remove_panel()
+        self._build_latex_panel()
+        self._build_markdown_panel()
+        self._build_output_folder_panel(right)
+
+        # ---- Run + progress (bottom, spans both columns) ----
+        runbar = ctk.CTkFrame(self)
+        runbar.grid(row=2, column=0, columnspan=2, sticky="ew",
+                    padx=12, pady=(0, 6))
+        runbar.grid_columnconfigure(1, weight=1)
+        self.run_btn = ctk.CTkButton(runbar, text="Start", width=140,
+                                     height=38,
+                                     font=ctk.CTkFont(size=15, weight="bold"),
+                                     command=self.start_processing)
+        self.run_btn.grid(row=0, column=0, padx=10, pady=10)
+        self.progress = ctk.CTkProgressBar(runbar)
+        self.progress.set(0)
+        self.progress.grid(row=0, column=1, sticky="ew", padx=10)
+        self.status_lbl = ctk.CTkLabel(runbar, text="Ready", width=120)
+        self.status_lbl.grid(row=0, column=2, padx=10)
+
+        # ---- Log ----
+        logframe = ctk.CTkFrame(self)
+        logframe.grid(row=3, column=0, columnspan=2, sticky="nsew",
+                      padx=12, pady=(0, 12))
+        self.grid_rowconfigure(3, weight=1)
+        logframe.grid_rowconfigure(1, weight=1)
+        logframe.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(logframe, text="Log", anchor="w"
+                     ).grid(row=0, column=0, sticky="w", padx=10, pady=(8, 0))
+        self.log = ctk.CTkTextbox(logframe, height=130, wrap="word")
+        self.log.grid(row=1, column=0, sticky="nsew", padx=10, pady=8)
+        self.log.configure(state="disabled")
+
+        self._refresh_panels()
+        self._log(f"{about_info.APP_NAME} v{about_info.VERSION} ready. "
+                  "Add PDFs, choose an operation, then click Start.")
+
+    # ---- option panels ----
+    def _build_remove_panel(self):
+        p = ctk.CTkFrame(self.options_holder)
+        ctk.CTkLabel(p, text="What to remove:",
+                     anchor="w").pack(fill="x", padx=10, pady=(10, 2))
+        ctk.CTkRadioButton(
+            p, text="Images only (keep charts, tables, layout)",
+            variable=self.remove_mode, value="images"
+        ).pack(anchor="w", padx=16, pady=3)
+        ctk.CTkRadioButton(
+            p, text="Images + figures/charts (text-only result)",
+            variable=self.remove_mode, value="all"
+        ).pack(anchor="w", padx=16, pady=3)
+        ctk.CTkCheckBox(
+            p, text='Append "_noimg" to output names (avoid overwriting)',
+            variable=self.suffix_var
+        ).pack(anchor="w", padx=10, pady=(8, 4))
+        ctk.CTkLabel(p, text="Save output:", anchor="w"
+                     ).pack(fill="x", padx=10, pady=(8, 2))
+        ctk.CTkRadioButton(p, text="Beside each PDF",
+                           variable=self.remove_dest, value="beside",
+                           command=self._refresh_panels
+                           ).pack(anchor="w", padx=16, pady=3)
+        ctk.CTkRadioButton(p, text="In one chosen output folder",
+                           variable=self.remove_dest, value="folder",
+                           command=self._refresh_panels
+                           ).pack(anchor="w", padx=16, pady=(3, 10))
+        self.remove_panel = p
+
+    def _build_latex_panel(self):
+        p = ctk.CTkFrame(self.options_holder)
+        ctk.CTkLabel(
+            p, text="Each PDF becomes one compilable IEEE .tex file, with a "
+                    "shared \"Latex_Resource\" folder of extracted figures.",
+            anchor="w", justify="left", wraplength=320
+        ).pack(fill="x", padx=10, pady=(10, 6))
+        ctk.CTkLabel(p, text="Save the .tex (and Latex_Resource):",
+                     anchor="w").pack(fill="x", padx=10, pady=(2, 2))
+        ctk.CTkRadioButton(p, text="Beside each PDF",
+                           variable=self.latex_dest, value="beside",
+                           command=self._refresh_panels
+                           ).pack(anchor="w", padx=16, pady=3)
+        ctk.CTkRadioButton(p, text="In one chosen output folder",
+                           variable=self.latex_dest, value="folder",
+                           command=self._refresh_panels
+                           ).pack(anchor="w", padx=16, pady=(3, 10))
+        self.latex_panel = p
+
+    def _build_markdown_panel(self):
+        p = ctk.CTkFrame(self.options_holder)
+        ctk.CTkLabel(
+            p, text="Each PDF becomes one Markdown (.md) file containing the "
+                    "full text, with no images.",
+            anchor="w", justify="left", wraplength=320
+        ).pack(fill="x", padx=10, pady=(10, 6))
+        ctk.CTkLabel(p, text="Save the .md:", anchor="w"
+                     ).pack(fill="x", padx=10, pady=(2, 2))
+        ctk.CTkRadioButton(p, text="Beside each PDF",
+                           variable=self.md_dest, value="beside",
+                           command=self._refresh_panels
+                           ).pack(anchor="w", padx=16, pady=3)
+        ctk.CTkRadioButton(p, text="In one chosen output folder",
+                           variable=self.md_dest, value="folder",
+                           command=self._refresh_panels
+                           ).pack(anchor="w", padx=16, pady=(3, 10))
+        self.markdown_panel = p
+
+    def _build_output_folder_panel(self, parent):
+        p = ctk.CTkFrame(parent)
+        p.grid(row=5, column=0, sticky="ew", pady=(10, 4))
+        p.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(p, text="Output folder", anchor="w"
+                     ).grid(row=0, column=0, sticky="w", padx=10, pady=(10, 2))
+        row = ctk.CTkFrame(p, fg_color="transparent")
+        row.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 10))
+        row.grid_columnconfigure(0, weight=1)
+        self.out_entry = ctk.CTkEntry(row, textvariable=self.output_dir,
+                                      placeholder_text="Choose a folder\u2026")
+        self.out_entry.grid(row=0, column=0, sticky="ew")
+        ctk.CTkButton(row, text="Browse\u2026", width=90,
+                      command=self.choose_output).grid(row=0, column=1,
+                                                       padx=(8, 0))
+        self.output_folder_panel = p
+
+    def _current_dest(self):
+        op = self.operation.get()
+        return {"remove": self.remove_dest, "latex": self.latex_dest,
+                "markdown": self.md_dest}.get(op)
+
+    def _refresh_panels(self):
+        for panel in (self.remove_panel, self.latex_panel, self.markdown_panel):
+            panel.grid_forget()
+        op = self.operation.get()
+        if op == "remove":
+            self.remove_panel.grid(row=0, column=0, sticky="ew")
+        elif op == "latex":
+            self.latex_panel.grid(row=0, column=0, sticky="ew")
+        elif op == "markdown":
+            self.markdown_panel.grid(row=0, column=0, sticky="ew")
+        # Output-folder panel only matters when destination == folder.
+        dest = self._current_dest()
+        if op and dest and dest.get() == "folder":
+            self.output_folder_panel.grid()
+        else:
+            self.output_folder_panel.grid_remove()
+
+    # ----------------------------- list ops ------------------------------- #
     def _refresh_list(self):
         self.listbox.delete(0, tk.END)
         for p in self.pdf_paths:
             self.listbox.insert(tk.END, p)
-        self.count_label.config(text=f"PDFs queued: {len(self.pdf_paths)}")
+        self.count_label.configure(text=f"Queued: {len(self.pdf_paths)}")
 
     def _add_paths(self, paths):
         added = 0
@@ -292,28 +453,23 @@ class PdfImageRemoverApp:
     def add_files(self):
         paths = filedialog.askopenfilenames(
             title="Select PDF file(s)",
-            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
-        )
+            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")])
         if paths:
-            n = self._add_paths(paths)
-            self._log(f"Added {n} file(s).")
+            self._log(f"Added {self._add_paths(paths)} file(s).")
 
     def add_folder(self):
-        folder = filedialog.askdirectory(title="Select a folder containing PDFs")
+        folder = filedialog.askdirectory(title="Select a folder with PDFs")
         if not folder:
             return
-        found = find_pdfs_in_folder(folder, recursive=self.recursive_var.get())
+        found = find_pdfs_in_folder(folder, self.recursive_var.get())
         if not found:
-            messagebox.showinfo(APP_TITLE, "No PDF files found in that folder.")
+            messagebox.showinfo(about_info.APP_NAME, "No PDFs found there.")
             return
-        n = self._add_paths(found)
-        self._log(f"Found {len(found)} PDF(s) in folder; added {n} new.")
+        self._log(f"Found {len(found)} PDF(s); added "
+                  f"{self._add_paths(found)} new.")
 
     def remove_selected(self):
-        sel = list(self.listbox.curselection())
-        if not sel:
-            return
-        for index in reversed(sel):
+        for index in reversed(list(self.listbox.curselection())):
             del self.pdf_paths[index]
         self._refresh_list()
 
@@ -326,87 +482,117 @@ class PdfImageRemoverApp:
         if folder:
             self.output_dir.set(folder)
 
-    # ----------------------------- logging -------------------------------- #
+    # ------------------------------ logging ------------------------------- #
     def _log(self, text):
         self.log.configure(state="normal")
-        self.log.insert(tk.END, text + "\n")
-        self.log.see(tk.END)
+        self.log.insert("end", text + "\n")
+        self.log.see("end")
         self.log.configure(state="disabled")
 
-    # --------------------------- processing ------------------------------- #
+    def _open_about(self):
+        AboutDialog(self)
+
+    # ---------------------------- processing ------------------------------ #
     def start_processing(self):
-        if fitz is None:
-            messagebox.showerror(APP_TITLE, "PyMuPDF is not installed.")
-            return
         if not self.pdf_paths:
-            messagebox.showwarning(APP_TITLE, "Add at least one PDF first.")
+            messagebox.showwarning(about_info.APP_NAME,
+                                   "Add at least one PDF first.")
             return
+        op = self.operation.get()
+        if op not in ("remove", "latex", "markdown"):
+            messagebox.showerror(
+                about_info.APP_NAME,
+                "Please choose an operation (Remove images, Convert to "
+                "LaTeX, or Convert to Markdown) before starting.")
+            return
+
+        dest = self._current_dest().get()
         out_dir = self.output_dir.get().strip()
-        if not out_dir:
-            messagebox.showwarning(APP_TITLE, "Choose an output folder.")
-            return
-        if not os.path.isdir(out_dir):
+        if dest == "folder":
+            if not out_dir:
+                messagebox.showwarning(about_info.APP_NAME,
+                                       "Choose an output folder, or switch to "
+                                       "\"Beside each PDF\".")
+                return
             try:
                 os.makedirs(out_dir, exist_ok=True)
             except Exception as exc:  # noqa: BLE001
-                messagebox.showerror(APP_TITLE,
+                messagebox.showerror(about_info.APP_NAME,
                                      f"Cannot create output folder:\n{exc}")
                 return
 
-        remove_vector = self.mode_var.get() == "all"
-        self.run_btn.state(["disabled"])
-        self.progress.configure(value=0, maximum=len(self.pdf_paths))
-        self._log("-" * 50)
-        mode_txt = ("images + figures/charts (text-only)"
-                    if remove_vector else "images only")
-        self._log(f"Processing {len(self.pdf_paths)} file(s) -> {out_dir}")
-        self._log(f"Mode: {mode_txt}")
+        cfg = {
+            "op": op,
+            "dest": dest,
+            "out_dir": out_dir,
+            "remove_vector": self.remove_mode.get() == "all",
+            "suffix": "_noimg" if self.suffix_var.get() else "",
+            "files": list(self.pdf_paths),
+        }
 
-        files = list(self.pdf_paths)
-        suffix = DEFAULT_SUFFIX if self.suffix_var.get() else ""
-        self.worker = threading.Thread(
-            target=self._worker, args=(files, out_dir, suffix, remove_vector),
-            daemon=True,
-        )
+        self.run_btn.configure(state="disabled")
+        self.progress.configure(mode="determinate")
+        self.progress.set(0)
+        self.status_lbl.configure(text="Working\u2026")
+        self._log("-" * 60)
+        opname = {"remove": "Remove images", "latex": "Convert to LaTeX",
+                  "markdown": "Convert to Markdown"}[op]
+        self._log(f"Operation: {opname}  |  {len(cfg['files'])} file(s)")
+        if op == "remove":
+            self._log("  Mode: " + ("images + figures (text-only)"
+                                    if cfg["remove_vector"] else "images only"))
+        self._log("  Output: " + ("beside each PDF" if dest == "beside"
+                                   else out_dir))
+
+        self.worker = threading.Thread(target=self._worker, args=(cfg,),
+                                       daemon=True)
         self.worker.start()
 
-    def _worker(self, files, out_dir, suffix, remove_vector):
+    def _target_dir_for(self, src_path, cfg):
+        if cfg["dest"] == "beside":
+            return os.path.dirname(os.path.abspath(src_path))
+        return cfg["out_dir"]
+
+    def _worker(self, cfg):
         ok = fail = 0
+        files = cfg["files"]
+        total = len(files)
         for i, path in enumerate(files, start=1):
             base = os.path.basename(path)
             stem, ext = os.path.splitext(base)
-            out_name = f"{stem}{suffix}{ext}"
-            out_path = os.path.join(out_dir, out_name)
-            if os.path.abspath(out_path) == os.path.abspath(path):
-                out_path = os.path.join(out_dir, f"{stem}{DEFAULT_SUFFIX}{ext}")
-
+            target_dir = self._target_dir_for(path, cfg)
             try:
-                removed, remaining = remove_images_from_pdf(
-                    path, out_path, remove_vector=remove_vector
-                )
-                if remaining == 0:
-                    self.msg_queue.put(
-                        ("log", f"  OK  {base}  ->  {os.path.basename(out_path)} "
-                                f"({removed} image(s) removed)")
-                    )
-                elif remaining > 0:
-                    self.msg_queue.put(
-                        ("log", f"  OK* {base}: {removed} removed, "
-                                f"{remaining} image(s) could not be located")
-                    )
-                else:
-                    self.msg_queue.put(
-                        ("log", f"  OK  {base}: {removed} removed (verify skipped)")
-                    )
+                os.makedirs(target_dir, exist_ok=True)
+                if cfg["op"] == "remove":
+                    out_name = f"{stem}{cfg['suffix']}{ext}"
+                    out_path = os.path.join(target_dir, out_name)
+                    if os.path.abspath(out_path) == os.path.abspath(path):
+                        out_path = os.path.join(target_dir,
+                                                f"{stem}_noimg{ext}")
+                    removed, remaining = remove_images_from_pdf(
+                        path, out_path, remove_vector=cfg["remove_vector"])
+                    note = (f"{removed} image(s) removed"
+                            if remaining == 0 else
+                            f"{removed} removed, {remaining} could not be located")
+                    self.msg_queue.put(("log",
+                                        f"  OK  {base} -> "
+                                        f"{os.path.basename(out_path)} ({note})"))
+                elif cfg["op"] == "latex":
+                    tex = convert_pdf_to_latex(path, target_dir)
+                    self.msg_queue.put(("log",
+                                        f"  OK  {base} -> "
+                                        f"{os.path.basename(tex)} (+ Latex_Resource)"))
+                elif cfg["op"] == "markdown":
+                    md = convert_pdf_to_markdown(path, target_dir)
+                    self.msg_queue.put(("log",
+                                        f"  OK  {base} -> {os.path.basename(md)}"))
                 ok += 1
             except Exception as exc:  # noqa: BLE001
                 fail += 1
                 self.msg_queue.put(("log", f"  ERROR {base}: {exc}"))
-                self.msg_queue.put(("trace", traceback.format_exc()))
-
-            self.msg_queue.put(("progress", i))
-
-        self.msg_queue.put(("done", (ok, fail, out_dir)))
+                sys.stderr.write(traceback.format_exc() + "\n")
+            self.msg_queue.put(("progress", i / total))
+        self.msg_queue.put(("done", (ok, fail)))
 
     def _poll_queue(self):
         try:
@@ -414,43 +600,34 @@ class PdfImageRemoverApp:
                 kind, payload = self.msg_queue.get_nowait()
                 if kind == "log":
                     self._log(payload)
-                elif kind == "trace":
-                    sys.stderr.write(payload + "\n")
                 elif kind == "progress":
-                    self.progress.configure(value=payload)
+                    self.progress.set(payload)
                 elif kind == "done":
-                    ok, fail, out_dir = payload
-                    self._log("-" * 50)
+                    ok, fail = payload
+                    self._log("-" * 60)
                     self._log(f"Done. {ok} succeeded, {fail} failed.")
-                    self.run_btn.state(["!disabled"])
+                    self.run_btn.configure(state="normal")
+                    self.status_lbl.configure(
+                        text="Done" if fail == 0 else "Done (errors)")
                     if fail == 0:
-                        messagebox.showinfo(
-                            APP_TITLE,
-                            f"Finished. {ok} file(s) saved to:\n{out_dir}",
-                        )
+                        messagebox.showinfo(about_info.APP_NAME,
+                                            f"Finished. {ok} file(s) processed.")
                     else:
                         messagebox.showwarning(
-                            APP_TITLE,
-                            f"Finished with issues.\n{ok} succeeded, {fail} "
-                            "failed.\nSee the log for details.",
-                        )
+                            about_info.APP_NAME,
+                            f"Finished: {ok} ok, {fail} failed. See the log.")
         except queue.Empty:
             pass
-        self.root.after(100, self._poll_queue)
+        self.after(120, self._poll_queue)
 
 
 def main():
-    root = tk.Tk()
-    try:
-        style = ttk.Style()
-        if "vista" in style.theme_names():
-            style.theme_use("vista")
-        elif "clam" in style.theme_names():
-            style.theme_use("clam")
-    except Exception:
-        pass
-    PdfImageRemoverApp(root)
-    root.mainloop()
+    ctk.set_appearance_mode("dark")
+    ctk.set_default_color_theme("dark-blue")
+    close_pyi_splash()       # close native exe splash, if any
+    app = App()
+    show_source_splash()     # lightweight splash when run from source
+    app.mainloop()
 
 
 if __name__ == "__main__":

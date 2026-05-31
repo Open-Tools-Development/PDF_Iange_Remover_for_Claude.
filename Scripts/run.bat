@@ -1,26 +1,19 @@
 @echo off
+REM ====================================================================
+REM  PDF Image Remover - run from source (Python)
+REM ====================================================================
 setlocal
-echo Starting PDF Image Remover...
-
-REM Prefer the Python launcher (py), fall back to python on PATH
-set "PYCMD=py -3"
-py -3 --version >nul 2>nul
-if errorlevel 1 set "PYCMD=python"
-
-%PYCMD% --version >nul 2>nul
-if errorlevel 1 (
-    echo [ERROR] Python not found. Install Python 3.8+ and run
-    echo         install_dependencies.bat first.
-    echo.
-    pause
-    exit /b 1
+where py >nul 2>nul
+if %ERRORLEVEL%==0 (
+    set "PY=py -3"
+) else (
+    set "PY=python"
 )
-
-%PYCMD% "%~dp0pdf_image_remover.py"
-if errorlevel 1 (
+%PY% pdf_image_remover.py
+if %ERRORLEVEL% neq 0 (
     echo.
-    echo The program exited with an error.
-    echo If it mentions PyMuPDF is missing, run install_dependencies.bat first.
-    echo.
+    echo The program exited with an error. If dependencies are missing,
+    echo run install_dependencies.bat first.
     pause
 )
+endlocal
